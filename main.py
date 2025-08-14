@@ -483,20 +483,16 @@ async def on_shutdown(app):
 
 # Обработчик вебхука
 async def webhook_handler(request):
-    """Обработка входящих запросов вебхука"""
-    logger.debug(f"Получен запрос: {request.method} {request.url} from {request.remote}")
-    if request.method == "POST":
-        try:
-            data = await request.json()
-            logger.debug(f"Данные вебхука: {data}")
-            update = types.Update(**data)
-            await request.app['bot'].dp.feed_update(request.app['bot'].bot, update)
-            return web.json_response({"status": "ok"})
-        except Exception as e:
-            logger.error(f"Ошибка при обработке вебхука: {e}")
-            return web.json_response({"status": "error", "message": str(e)}, status=500)
-    logger.warning(f"Неподдерживаемый метод: {request.method}")
-    return web.json_response({"status": "method not allowed"}, status=405)
+    """Обработка входящих POST-запросов от Telegram."""
+    try:
+        data = await request.json()
+        logger.debug(f"Данные вебхука: {data}")
+        update = types.Update(**data)
+        await request.app['bot'].dp.feed_update(request.app['bot'].bot, update)
+        return web.json_response({"status": "ok"})
+    except Exception as e:
+        logger.error(f"Ошибка при обработке вебхука: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 # Запуск приложения
 async def main():
@@ -523,7 +519,11 @@ async def main():
 
     app = web.Application()
     app['bot'] = bot_instance
+    # Регистрируем обработчик для POST-запросов от Telegram
     app.router.add_post(config.webhook_path, webhook_handler)
+    # Добавляем информационный GET-обработчик для того же пути
+    app.router.add_get(config.webhook_path, lambda _: web.Response(text="Webhook is active and waiting for POST requests from Telegram."))
+    # Корневой путь для проверки работоспособности
     app.router.add_get("/", lambda _: web.Response(text="Бот работает!"))
     app.on_startup.append(lambda app: on_startup(app['bot']))
     app.on_cleanup.append(on_shutdown)
