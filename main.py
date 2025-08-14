@@ -523,7 +523,7 @@ async def main():
 
     app = web.Application()
     app['bot'] = bot_instance
-    app.router.add_post(WEBHOOK_PATH, webhook_handler)
+    app.router.add_post(config.webhook_path, webhook_handler)
     app.router.add_get("/", lambda _: web.Response(text="Бот работает!"))
     app.on_startup.append(lambda app: on_startup(app['bot']))
     app.on_cleanup.append(on_shutdown)
@@ -533,7 +533,7 @@ async def main():
     site = web.TCPSite(runner, config.web_server_host, config.web_server_port)
     try:
         await site.start()
-        logger.info(f"Сервер запущен на {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
+        logger.info(f"Сервер запущен на {config.web_server_host}:{config.web_server_port}")
         await asyncio.Event().wait()  # Ждём бесконечно
     except Exception as e:
         logger.error(f"Ошибка сервера: {e}")
