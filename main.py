@@ -23,11 +23,17 @@ HTEST_ENABLED = True
 FASTOUT_ENABLED = True
 
 # Формат URL для Replit
-REPL_SLUG = os.getenv('REPL_SLUG', 'workspace')
-REPL_OWNER = os.getenv('REPL_OWNER', 'user')
+# REPL_SLUG = os.getenv('REPL_SLUG', 'workspace')
+# REPL_OWNER = os.getenv('REPL_OWNER', 'user')
 # WEBHOOK_URL = f"https://{REPL_SLUG}-{REPL_OWNER}.replit.app{WEBHOOK_PATH}"
-# URL для вебхука (мы будем получать его из переменной окружения Railway)
-WEBHOOK_URL = os.getenv('WEBHOOK_URL')
+# URL для вебхука. Мы берем базовый URL из переменной окружения
+# и добавляем к нему путь, на котором бот будет слушать обновления.
+BASE_WEBHOOK_URL = os.getenv('WEBHOOK_URL')
+WEBHOOK_URL = None
+if BASE_WEBHOOK_URL:
+    # Убираем возможный слэш в конце, чтобы избежать двойных слэшей
+    BASE_WEBHOOK_URL = BASE_WEBHOOK_URL.rstrip('/')
+    WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 
 # Настройка логирования
 logging.basicConfig(
@@ -423,7 +429,12 @@ async def main():
         logger.error("TELEGRAM_BOT_TOKEN не установлен!")
         return
 
-    logger.info(f"REPL_SLUG: {REPL_SLUG}, REPL_OWNER: {REPL_OWNER}, WEBHOOK_URL: {WEBHOOK_URL}")
+    if not WEBHOOK_URL:
+        logger.error("Переменная окружения WEBHOOK_URL не установлена. Запуск остановлен.")
+        return
+
+    # Убираем неактуальные для Railway переменные из лога
+    logger.info(f"Полный URL вебхука для установки: {WEBHOOK_URL}")
 
     bot = VerificationBot(token)
     app.router.add_post(WEBHOOK_PATH, webhook_handler)
