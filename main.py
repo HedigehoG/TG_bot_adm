@@ -5,9 +5,11 @@ from typing import Dict, List
 import os
 import random
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ChatMemberStatus, ContentType
 from aiogram.filters import Command, CommandStart, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
-from aiogram.types import ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, PollAnswer
+from aiogram.filters.callback_data import CallbackData
+from aiogram.types import ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, PollAnswer, User
 from aiohttp import web
 
 # Настройки
@@ -17,6 +19,26 @@ WEB_SERVER_PORT = 5000
 VERIFICATION_TIMEOUT = 300  # 5 минут на верификацию
 MESSAGE_CLEANUP_TIME = 600  # 10 минут хранения сообщений
 BAN_NOTIFICATION_TIME = 180  # 3 минуты для уведомления о бане
+
+# Константы прав доступа
+RESTRICTED_PERMISSIONS = ChatPermissions(
+    can_send_messages=False,
+    can_send_media_messages=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+    can_change_info=False,
+    can_invite_users=False,
+    can_pin_messages=False
+)
+
+DEFAULT_PERMISSIONS = ChatPermissions(
+    can_send_messages=True,
+    can_send_media_messages=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+)
 
 # Механизмы проверки
 HTEST_ENABLED = True
@@ -42,6 +64,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# CallbackData для кнопок администратора
+class AdminAction(CallbackData, prefix="admin"):
+    action: str  # "approve" or "reject"
+    user_id: int
+
 # Класс бота
 class VerificationBot:
     def __init__(self, token: str):
@@ -56,21 +83,35 @@ class VerificationBot:
 
     def setup_handlers(self):
         """Настройка обработчиков событий"""
-        self.dp.chat_member(ChatMemberUpdatedFilter(
-            member_status_changed=(IS_NOT_MEMBER, IS_MEMBER)
-        ))(self.handle_new_member)
-        self.dp.chat_member(ChatMemberUpdatedFilter(
-            member_status_changed=(IS_MEMBER, IS_NOT_MEMBER)
-        ))(self.handle_member_left)
+        # Единый обработчик для всех изменений статуса участника
+        self.dp.chat_member()(self.on_chat_member_update)
+
         self.dp.poll_answer()(self.handle_poll_answer)
-        self.dp.callback_query(lambda c: c.data.startswith("reaction_"))(self.handle_reaction)
+        self.dp.callback_query(AdminAction.filter())(self.handle_reaction)
+
         # Обработчики команд должны идти перед общими обработчиками сообщений
         self.dp.message(Command("htest"))(self.toggle_htest)
         self.dp.message(Command("fastout"))(self.toggle_fastout)
         self.dp.message(Command("status"))(self.show_status)
         self.dp.message(CommandStart())(self.start_command)
+
         # Этот обработчик должен быть последним, т.к. он самый общий и отлавливает все сообщения в группе
-        self.dp.message(lambda m: m.chat.type in ["group", "supergroup"])(self.handle_message_from_new_member)
+        # Он отлавливает только контентные сообщения для механизма FastOut
+        self.dp.message(
+            F.chat.type.in_({"group", "supergroup"}),
+            F.content_type.in_({
+                ContentType.TEXT, ContentType.PHOTO, ContentType.VIDEO,
+                ContentType.DOCUMENT, ContentType.AUDIO, ContentType.VOICE,
+                ContentType.STICKER, ContentType.ANIMATION
+            })
+        )(self.handle_message_from_new_member)
+
+    async def on_chat_member_update(self, event: ChatMemberUpdated):
+        """Отлавливает все изменения статуса участников и направляет их."""
+        if event.new_chat_member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED} and event.old_chat_member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED}:
+            await self.handle_new_member(event)
+        elif event.new_chat_member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} and event.old_chat_member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR, ChatMemberStatus.RESTRICTED}:
+            await self.handle_member_left(event)
 
     async def start_command(self, message: types.Message):
         """Обработчик команды /start"""
@@ -90,24 +131,13 @@ class VerificationBot:
         chat = event.chat
         logger.info(f"Новый участник {user.id} в чате {chat.id}")
 
-        restricted_permissions = ChatPermissions(
-            can_send_messages=False,
-            can_send_media_messages=False,
-            can_send_polls=False,
-            can_send_other_messages=False,
-            can_add_web_page_previews=False,
-            can_change_info=False,
-            can_invite_users=False,
-            can_pin_messages=False
-        )
-
         try:
-            await self.bot.restrict_chat_member(chat_id=chat.id, user_id=user.id, permissions=restricted_permissions)
+            await self.bot.restrict_chat_member(chat_id=chat.id, user_id=user.id, permissions=RESTRICTED_PERMISSIONS)
             await self.create_verification_poll(chat.id, user)
         except Exception as e:
             logger.error(f"Ошибка при ограничении прав пользователя {user.id}: {e}")
 
-    async def create_verification_poll(self, chat_id: int, user):
+    async def create_verification_poll(self, chat_id: int, user: User):
         """Создание опроса для верификации"""
         username = user.username or user.first_name or "Новый участник"
         poll_question = f"Приветствуем тебя, {username}\nОтветь на вопрос или покинь группу"
@@ -140,8 +170,8 @@ class VerificationBot:
 
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="👍", callback_data=f"reaction_approve_{user.id}"),
-                    InlineKeyboardButton(text="👎", callback_data=f"reaction_reject_{user.id}")
+                    InlineKeyboardButton(text="👍", callback_data=AdminAction(action="approve", user_id=user.id).pack()),
+                    InlineKeyboardButton(text="👎", callback_data=AdminAction(action="reject", user_id=user.id).pack())
                 ]
             ])
             await self.bot.edit_message_reply_markup(
@@ -181,14 +211,14 @@ class VerificationBot:
         else:
             await self.reject_user(user.id, "Неправильный ответ на опрос")
 
-    async def handle_reaction(self, callback: types.CallbackQuery):
+    async def handle_reaction(self, callback: types.CallbackQuery, callback_data: AdminAction):
         """Обработка реакций админов"""
         if not await self.is_admin(callback.from_user.id, callback.message.chat.id):
             await callback.answer("Только администраторы могут использовать эти кнопки")
             return
 
-        data_parts = callback.data.split("_")
-        action, user_id = data_parts[1], int(data_parts[2])
+        action = callback_data.action
+        user_id = callback_data.user_id
 
         if user_id not in self.pending_verifications:
             await callback.answer("Этот пользователь уже прошел верификацию или был исключен.", show_alert=True)
@@ -218,19 +248,8 @@ class VerificationBot:
 
         chat_id = verification_data["chat_id"]
 
-        default_permissions = ChatPermissions(
-            can_send_messages=True,
-            can_send_media_messages=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
-            can_change_info=False,
-            can_invite_users=False,
-            can_pin_messages=False
-        )
-
         try:
-            await self.bot.restrict_chat_member(chat_id=chat_id, user_id=user_id, permissions=default_permissions)
+            await self.bot.restrict_chat_member(chat_id=chat_id, user_id=user_id, permissions=DEFAULT_PERMISSIONS)
             await self.bot.delete_message(chat_id=chat_id, message_id=verification_data["message_id"])
             await self.bot.send_message(
                 chat_id=chat_id,
