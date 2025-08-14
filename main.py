@@ -1,25 +1,41 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 import os
 import random
+from dataclasses import dataclass
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ChatMemberStatus, ContentType
-from aiogram.exceptions import TelegramAPIError, MessageNotModified
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, PollAnswer, User
 from aiohttp import web
 
-# Настройки
-WEBHOOK_PATH = "/webhook"
-WEB_SERVER_HOST = "0.0.0.0"
-WEB_SERVER_PORT = 5000
-VERIFICATION_TIMEOUT = 300  # 5 минут на верификацию
-MESSAGE_CLEANUP_TIME = 600  # 10 минут хранения сообщений
-BAN_NOTIFICATION_TIME = 180  # 3 минуты для уведомления о бане
+@dataclass
+class Config:
+    """Класс для хранения конфигурации бота."""
+    bot_token: str
+    base_webhook_url: Optional[str]
+
+    webhook_path: str = "/webhook"
+    web_server_host: str = "0.0.0.0"
+    web_server_port: int = 5000
+
+    verification_timeout: int = 300  # 5 минут
+    message_cleanup_time: int = 600  # 10 минут
+    ban_notification_time: int = 180  # 3 минуты
+
+    htest_enabled_default: bool = True
+    fastout_enabled_default: bool = True
+
+    @property
+    def webhook_url(self) -> Optional[str]:
+        if not self.base_webhook_url:
+            return None
+        return f"{self.base_webhook_url.rstrip('/')}{self.webhook_path}"
 
 # Константы прав доступа
 RESTRICTED_PERMISSIONS = ChatPermissions(
@@ -41,19 +57,6 @@ DEFAULT_PERMISSIONS = ChatPermissions(
     can_add_web_page_previews=True,
 )
 
-# Механизмы проверки
-HTEST_ENABLED = True
-FASTOUT_ENABLED = True
-
-# URL для вебхука. Мы берем базовый URL из переменной окружения
-# и добавляем к нему путь, на котором бот будет слушать обновления.
-BASE_WEBHOOK_URL = os.getenv('WEBHOOK_URL')
-WEBHOOK_URL = None
-if BASE_WEBHOOK_URL:
-    # Убираем возможный слэш в конце, чтобы избежать двойных слэшей
-    BASE_WEBHOOK_URL = BASE_WEBHOOK_URL.rstrip('/')
-    WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
-
 # Настройка логирования
 logging.basicConfig(
     level=logging.DEBUG,
@@ -71,14 +74,15 @@ class IgnoreCallback(CallbackData, prefix="ignore"):
 
 # Класс бота
 class VerificationBot:
-    def __init__(self, token: str):
-        self.bot = Bot(token=token)
+    def __init__(self, config: Config):
+        self.config = config
+        self.bot = Bot(token=self.config.bot_token)
         self.dp = Dispatcher()
         self.pending_verifications: Dict[int, Dict] = {}  # user_id -> verification_data
         self.user_messages: Dict[int, List[int]] = {}    # user_id -> [message_ids]
         self.ban_notifications: Dict[int, int] = {}      # chat_id -> message_id
-        self.htest_enabled = HTEST_ENABLED
-        self.fastout_enabled = FASTOUT_ENABLED
+        self.htest_enabled = self.config.htest_enabled_default
+        self.fastout_enabled = self.config.fastout_enabled_default
         self.setup_handlers()
 
     def setup_handlers(self):
@@ -118,7 +122,7 @@ class VerificationBot:
         try:
             await message.reply("Привет! Я бот для верификации пользователей. Мои настройки можно посмотреть по команде /status.")
             logger.info(f"Ответ на /start отправлен в чат {message.chat.id}")
-        except Exception as e:
+        except TelegramAPIError as e:
             logger.error(f"Ошибка при отправке ответа на /start в чат {message.chat.id}: {e}")
 
     async def handle_new_member(self, event: ChatMemberUpdated):
@@ -158,7 +162,7 @@ class VerificationBot:
         random.shuffle(poll_options)
         correct_option_id = poll_options.index(correct_answer)
 
-        minutes, seconds = divmod(VERIFICATION_TIMEOUT, 60)
+        minutes, seconds = divmod(self.config.verification_timeout, 60)
         timer_text = f"⏳ {minutes:02d}:{seconds:02d}"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -183,7 +187,7 @@ class VerificationBot:
                 "poll_id": poll_message.poll.id,
                 "message_id": poll_message.message_id,
                 "correct_option_id": correct_option_id,
-                "deadline": datetime.now() + timedelta(seconds=VERIFICATION_TIMEOUT),
+                "deadline": datetime.now() + timedelta(seconds=self.config.verification_timeout),
                 "user": user
             }
             # Запускаем и таймер на удаление, и таймер на обновление кнопки
@@ -286,13 +290,13 @@ class VerificationBot:
 
     async def verification_timeout(self, user_id: int):
         """Таймер верификации"""
-        await asyncio.sleep(VERIFICATION_TIMEOUT)
+        await asyncio.sleep(self.config.verification_timeout)
         if user_id in self.pending_verifications:
             await self.reject_user(user_id, "Превышено время верификации")
 
     async def remove_ban_notification(self, chat_id: int, message_id: int):
         """Удаление уведомления о бане"""
-        await asyncio.sleep(BAN_NOTIFICATION_TIME)
+        await asyncio.sleep(self.config.ban_notification_time)
         try:
             await self.bot.delete_message(chat_id=chat_id, message_id=message_id)
             self.ban_notifications.pop(chat_id, None)
@@ -331,8 +335,11 @@ class VerificationBot:
                     reply_markup=keyboard
                 )
                 await asyncio.sleep(10)
-            except MessageNotModified:
-                await asyncio.sleep(10)
+            except TelegramBadRequest as e:
+                if "message is not modified" in e.message:
+                    await asyncio.sleep(10)  # Ошибка ожидаемая, просто продолжаем
+                else:
+                    raise  # Другая, неожиданная ошибка
             except TelegramAPIError as e:
                 logger.warning(f"Не удалось обновить таймер для {user_id} (возможно, сообщение удалено): {e}")
                 break
@@ -350,7 +357,7 @@ class VerificationBot:
             try:
                 await message.delete()
                 logger.info(f"Удалено сообщение от пользователя {user_id}, который находится на верификации.")
-            except Exception as e:
+            except TelegramAPIError as e:
                 logger.warning(f"Не удалось удалить сообщение от пользователя {user_id} на верификации: {e}")
             return
 
@@ -415,7 +422,7 @@ class VerificationBot:
             await message.reply(f"Механизм {mechanism} {'включен' if new_state else 'выключен'}")
             logger.info(f"Механизм {mechanism} переключен на {action} пользователем {message.from_user.id}")
 
-        except Exception as e:
+        except TelegramAPIError as e:
             logger.error(f"Ошибка при обработке команды /{mechanism} от {message.from_user.id}: {e}")
 
     async def show_status(self, message: types.Message):
@@ -426,9 +433,9 @@ class VerificationBot:
 • HTest (опросы): {'✅ включен' if self.htest_enabled else '❌ выключен'}
 • FastOut (отслеживание): {'✅ включен' if self.fastout_enabled else '❌ выключен'}
 ⏱ Настройки времени:
-• Время верификации: {VERIFICATION_TIMEOUT // 60} мин
-• Хранение сообщений: {MESSAGE_CLEANUP_TIME // 60} мин
-• Уведомления о бане: {BAN_NOTIFICATION_TIME // 60} мин
+• Время верификации: {self.config.verification_timeout // 60} мин
+• Хранение сообщений: {self.config.message_cleanup_time // 60} мин
+• Уведомления о бане: {self.config.ban_notification_time // 60} мин
 👥 Активность:
 • Ожидают верификации: {len(self.pending_verifications)}
 • Отслеживаемые пользователи: {len(self.user_messages)}
@@ -437,7 +444,7 @@ class VerificationBot:
         try:
             await message.reply(status_text)
             logger.info(f"Статус бота отправлен в чат {message.chat.id}")
-        except Exception as e:
+        except TelegramAPIError as e:
             logger.error(f"Ошибка при отправке статуса в чат {message.chat.id}: {e}")
 
     async def handle_ignore_callback(self, callback: types.CallbackQuery):
@@ -448,19 +455,19 @@ class VerificationBot:
         """Проверка прав администратора"""
         try:
             chat_member = await self.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-            return chat_member.status in ["creator", "administrator"]
-        except Exception as e:
+            return chat_member.status in [ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR]
+        except TelegramAPIError as e:
             logger.error(f"Ошибка при проверке прав админа для {user_id} в чате {chat_id}: {e}")
             return False
 
 # Настройка вебхука
-async def on_startup(app):
+async def on_startup(bot_instance: VerificationBot):
     """Установка вебхука при запуске"""
     try:
-        await bot.bot.delete_webhook(drop_pending_updates=True)
-        await bot.bot.set_webhook(WEBHOOK_URL, allowed_updates=["message", "callback_query", "poll_answer", "chat_member"])
-        logger.info(f"Вебхук установлен: {WEBHOOK_URL}")
-        webhook_info = await bot.bot.get_webhook_info()
+        await bot_instance.bot.delete_webhook(drop_pending_updates=True)
+        await bot_instance.bot.set_webhook(bot_instance.config.webhook_url, allowed_updates=["message", "callback_query", "poll_answer", "chat_member"])
+        logger.info(f"Вебхук установлен: {bot_instance.config.webhook_url}")
+        webhook_info = await bot_instance.bot.get_webhook_info()
         logger.info(f"Информация о вебхуке: {webhook_info}")
     except Exception as e:
         logger.error(f"Ошибка установки вебхука: {e}")
@@ -468,8 +475,8 @@ async def on_startup(app):
 async def on_shutdown(app):
     """Очистка при остановке"""
     try:
-        await bot.bot.delete_webhook(drop_pending_updates=True)
-        await bot.bot.session.close()
+        await app['bot'].bot.delete_webhook(drop_pending_updates=True)
+        await app['bot'].bot.session.close()
         logger.info("Бот остановлен, вебхук удалён")
     except Exception as e:
         logger.error(f"Ошибка при остановке: {e}")
@@ -483,7 +490,7 @@ async def webhook_handler(request):
             data = await request.json()
             logger.debug(f"Данные вебхука: {data}")
             update = types.Update(**data)
-            await bot.dp.feed_update(bot.bot, update)
+            await request.app['bot'].dp.feed_update(request.app['bot'].bot, update)
             return web.json_response({"status": "ok"})
         except Exception as e:
             logger.error(f"Ошибка при обработке вебхука: {e}")
@@ -492,33 +499,38 @@ async def webhook_handler(request):
     return web.json_response({"status": "method not allowed"}, status=405)
 
 # Запуск приложения
-app = web.Application()
-bot = None
-
 async def main():
     """Основная функция запуска"""
-    global bot
-    token = os.environ.get('TELEGRAM_BOT_TOKEN')
-    if not token:
+    bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    if not bot_token:
         logger.error("TELEGRAM_BOT_TOKEN не установлен!")
         return
 
-    if not WEBHOOK_URL:
+    base_webhook_url = os.environ.get('WEBHOOK_URL')
+    if not base_webhook_url:
         logger.error("Переменная окружения WEBHOOK_URL не установлена. Запуск остановлен.")
         return
 
-    # Убираем неактуальные для Railway переменные из лога
-    logger.info(f"Полный URL вебхука для установки: {WEBHOOK_URL}")
+    config = Config(
+        bot_token=bot_token,
+        base_webhook_url=base_webhook_url,
+        web_server_port=int(os.getenv("PORT", 5000)) # Для совместимости с Heroku/Railway
+    )
 
-    bot = VerificationBot(token)
+    logger.info(f"Полный URL вебхука для установки: {config.webhook_url}")
+
+    bot_instance = VerificationBot(config)
+
+    app = web.Application()
+    app['bot'] = bot_instance
     app.router.add_post(WEBHOOK_PATH, webhook_handler)
     app.router.add_get("/", lambda _: web.Response(text="Бот работает!"))
-    app.on_startup.append(on_startup)
+    app.on_startup.append(lambda app: on_startup(app['bot']))
     app.on_cleanup.append(on_shutdown)
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, WEB_SERVER_HOST, WEB_SERVER_PORT)
+    site = web.TCPSite(runner, config.web_server_host, config.web_server_port)
     try:
         await site.start()
         logger.info(f"Сервер запущен на {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
