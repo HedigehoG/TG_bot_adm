@@ -7,6 +7,7 @@ import random
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ChatMemberStatus, ContentType
+from aiogram.exceptions import TelegramAPIError, MessageNotModified
 from aiogram.filters import Command, CommandStart, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, PollAnswer, User
@@ -44,10 +45,6 @@ DEFAULT_PERMISSIONS = ChatPermissions(
 HTEST_ENABLED = True
 FASTOUT_ENABLED = True
 
-# Формат URL для Replit
-# REPL_SLUG = os.getenv('REPL_SLUG', 'workspace')
-# REPL_OWNER = os.getenv('REPL_OWNER', 'user')
-# WEBHOOK_URL = f"https://{REPL_SLUG}-{REPL_OWNER}.replit.app{WEBHOOK_PATH}"
 # URL для вебхука. Мы берем базовый URL из переменной окружения
 # и добавляем к нему путь, на котором бот будет слушать обновления.
 BASE_WEBHOOK_URL = os.getenv('WEBHOOK_URL')
@@ -69,6 +66,9 @@ class AdminAction(CallbackData, prefix="admin"):
     action: str  # "approve" or "reject"
     user_id: int
 
+class IgnoreCallback(CallbackData, prefix="ignore"):
+    pass  # Данные не нужны, просто для фильтра
+
 # Класс бота
 class VerificationBot:
     def __init__(self, token: str):
@@ -83,11 +83,17 @@ class VerificationBot:
 
     def setup_handlers(self):
         """Настройка обработчиков событий"""
-        # Единый обработчик для всех изменений статуса участника
-        self.dp.chat_member()(self.on_chat_member_update)
+        # Раздельные, но надежные обработчики для входа и выхода участников
+        self.dp.chat_member(
+            ChatMemberUpdatedFilter(member_status_changed=(IS_NOT_MEMBER, IS_MEMBER))
+        )(self.handle_new_member)
+        self.dp.chat_member(
+            ChatMemberUpdatedFilter(member_status_changed=(IS_MEMBER, IS_NOT_MEMBER))
+        )(self.handle_member_left)
 
         self.dp.poll_answer()(self.handle_poll_answer)
         self.dp.callback_query(AdminAction.filter())(self.handle_reaction)
+        self.dp.callback_query(IgnoreCallback.filter())(self.handle_ignore_callback)
 
         # Обработчики команд должны идти перед общими обработчиками сообщений
         self.dp.message(Command("htest"))(self.toggle_htest)
@@ -106,25 +112,18 @@ class VerificationBot:
             })
         )(self.handle_message_from_new_member)
 
-    async def on_chat_member_update(self, event: ChatMemberUpdated):
-        """Отлавливает все изменения статуса участников и направляет их."""
-        if event.new_chat_member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED} and event.old_chat_member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED}:
-            await self.handle_new_member(event)
-        elif event.new_chat_member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} and event.old_chat_member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR, ChatMemberStatus.RESTRICTED}:
-            await self.handle_member_left(event)
-
     async def start_command(self, message: types.Message):
         """Обработчик команды /start"""
         logger.info(f"Получена команда /start от {message.from_user.id} в чате {message.chat.id}")
         try:
-            await message.reply("Привет! Бот работает через вебхук на Replit.")
+            await message.reply("Привет! Я бот для верификации пользователей. Мои настройки можно посмотреть по команде /status.")
             logger.info(f"Ответ на /start отправлен в чат {message.chat.id}")
         except Exception as e:
             logger.error(f"Ошибка при отправке ответа на /start в чат {message.chat.id}: {e}")
 
     async def handle_new_member(self, event: ChatMemberUpdated):
         """Обработка нового участника"""
-        if not self.htest_enabled:
+        if not self.htest_enabled or event.new_chat_member.user.id == self.bot.id:
             return
 
         user = event.new_chat_member.user
@@ -134,7 +133,7 @@ class VerificationBot:
         try:
             await self.bot.restrict_chat_member(chat_id=chat.id, user_id=user.id, permissions=RESTRICTED_PERMISSIONS)
             await self.create_verification_poll(chat.id, user)
-        except Exception as e:
+        except TelegramAPIError as e:
             logger.error(f"Ошибка при ограничении прав пользователя {user.id}: {e}")
 
     async def create_verification_poll(self, chat_id: int, user: User):
@@ -159,24 +158,23 @@ class VerificationBot:
         random.shuffle(poll_options)
         correct_option_id = poll_options.index(correct_answer)
 
+        minutes, seconds = divmod(VERIFICATION_TIMEOUT, 60)
+        timer_text = f"⏳ {minutes:02d}:{seconds:02d}"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👍", callback_data=AdminAction(action="approve", user_id=user.id).pack()),
+                InlineKeyboardButton(text=timer_text, callback_data=IgnoreCallback().pack()),
+                InlineKeyboardButton(text="👎", callback_data=AdminAction(action="reject", user_id=user.id).pack())
+            ]
+        ])
+
         try:
             poll_message = await self.bot.send_poll(
                 chat_id=chat_id,
                 question=poll_question,
                 options=poll_options,
                 is_anonymous=False,
-                allows_multiple_answers=False
-            )
-
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="👍", callback_data=AdminAction(action="approve", user_id=user.id).pack()),
-                    InlineKeyboardButton(text="👎", callback_data=AdminAction(action="reject", user_id=user.id).pack())
-                ]
-            ])
-            await self.bot.edit_message_reply_markup(
-                chat_id=chat_id,
-                message_id=poll_message.message_id,
+                allows_multiple_answers=False,
                 reply_markup=keyboard
             )
 
@@ -188,9 +186,11 @@ class VerificationBot:
                 "deadline": datetime.now() + timedelta(seconds=VERIFICATION_TIMEOUT),
                 "user": user
             }
+            # Запускаем и таймер на удаление, и таймер на обновление кнопки
             asyncio.create_task(self.verification_timeout(user.id))
+            asyncio.create_task(self.update_timer_display(user.id))
             logger.info(f"Создан опрос для пользователя {user.id} в чате {chat_id}")
-        except Exception as e:
+        except TelegramAPIError as e:
             logger.error(f"Ошибка при создании опроса для пользователя {user.id}: {e}")
 
     async def handle_poll_answer(self, poll_answer: PollAnswer):
@@ -237,7 +237,7 @@ class VerificationBot:
             elif action == "reject":
                 await self.reject_user(user_id, "Отклонен администратором")
                 await callback.answer("Пользователь отклонен")
-        except Exception as e:
+        except TelegramAPIError as e:
             logger.error(f"Ошибка при обработке реакции {action} для пользователя {user_id}: {e}")
 
     async def approve_user(self, user_id: int):
@@ -257,7 +257,7 @@ class VerificationBot:
                 disable_notification=True
             )
             logger.info(f"Пользователь {user_id} одобрен в чате {chat_id}")
-        except Exception as e:
+        except TelegramAPIError as e:
             logger.error(f"Ошибка при одобрении пользователя {user_id}: {e}")
 
     async def reject_user(self, user_id: int, reason: str):
@@ -281,7 +281,7 @@ class VerificationBot:
             self.ban_notifications[chat_id] = ban_message.message_id
             asyncio.create_task(self.remove_ban_notification(chat_id, ban_message.message_id))
             logger.info(f"Пользователь {user_id} исключен из чата {chat_id}: {reason}")
-        except Exception as e:
+        except TelegramAPIError as e:
             logger.error(f"Ошибка при исключении пользователя {user_id}: {e}")
 
     async def verification_timeout(self, user_id: int):
@@ -296,9 +296,47 @@ class VerificationBot:
         try:
             await self.bot.delete_message(chat_id=chat_id, message_id=message_id)
             self.ban_notifications.pop(chat_id, None)
-            logger.info(f"Уведомление о бане удалено в чате {chat_id}")
-        except Exception as e:
+            logger.debug(f"Уведомление о бане удалено в чате {chat_id}")
+        except TelegramAPIError as e:
             logger.error(f"Ошибка при удалении уведомления о бане: {e}")
+
+    async def update_timer_display(self, user_id: int):
+        """Обновляет таймер на кнопке в сообщении с опросом."""
+        while user_id in self.pending_verifications:
+            try:
+                verification_data = self.pending_verifications.get(user_id)
+                if not verification_data:
+                    break
+
+                deadline = verification_data["deadline"]
+                remaining_seconds = int((deadline - datetime.now()).total_seconds())
+
+                if remaining_seconds <= 0:
+                    break
+
+                minutes, seconds = divmod(remaining_seconds, 60)
+                timer_text = f"⏳ {minutes:02d}:{seconds:02d}"
+
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="👍", callback_data=AdminAction(action="approve", user_id=user_id).pack()),
+                        InlineKeyboardButton(text=timer_text, callback_data=IgnoreCallback().pack()),
+                        InlineKeyboardButton(text="👎", callback_data=AdminAction(action="reject", user_id=user_id).pack())
+                    ]
+                ])
+
+                await self.bot.edit_message_reply_markup(
+                    chat_id=verification_data["chat_id"],
+                    message_id=verification_data["message_id"],
+                    reply_markup=keyboard
+                )
+                await asyncio.sleep(10)
+            except MessageNotModified:
+                await asyncio.sleep(10)
+            except TelegramAPIError as e:
+                logger.warning(f"Не удалось обновить таймер для {user_id} (возможно, сообщение удалено): {e}")
+                break
+        logger.debug(f"Таймер для пользователя {user_id} остановлен.")
 
     async def handle_message_from_new_member(self, message: types.Message):
         """Обработка сообщений от участников"""
@@ -337,7 +375,7 @@ class VerificationBot:
             for message_id in self.user_messages[user_id]:
                 try:
                     await self.bot.delete_message(chat_id=chat_id, message_id=message_id)
-                except Exception as e:
+                except TelegramAPIError as e:
                     logger.error(f"Ошибка при удалении сообщения {message_id}: {e}")
             del self.user_messages[user_id]
             logger.info(f"Сообщения пользователя {user_id} удалены из чата {chat_id}")
@@ -401,6 +439,10 @@ class VerificationBot:
             logger.info(f"Статус бота отправлен в чат {message.chat.id}")
         except Exception as e:
             logger.error(f"Ошибка при отправке статуса в чат {message.chat.id}: {e}")
+
+    async def handle_ignore_callback(self, callback: types.CallbackQuery):
+        """Обрабатывает нажатие на кнопку-таймер, ничего не делая."""
+        await callback.answer(cache_time=60)
 
     async def is_admin(self, user_id: int, chat_id: int) -> bool:
         """Проверка прав администратора"""
