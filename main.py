@@ -25,7 +25,9 @@ FASTOUT_ENABLED = True
 # Формат URL для Replit
 REPL_SLUG = os.getenv('REPL_SLUG', 'workspace')
 REPL_OWNER = os.getenv('REPL_OWNER', 'user')
-WEBHOOK_URL = f"https://{REPL_SLUG}-{REPL_OWNER}.replit.app{WEBHOOK_PATH}"
+# WEBHOOK_URL = f"https://{REPL_SLUG}-{REPL_OWNER}.replit.app{WEBHOOK_PATH}"
+# URL для вебхука (мы будем получать его из переменной окружения Railway)
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 
 # Настройка логирования
 logging.basicConfig(
