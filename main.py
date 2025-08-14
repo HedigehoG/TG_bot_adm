@@ -64,11 +64,13 @@ class VerificationBot:
         ))(self.handle_member_left)
         self.dp.poll_answer()(self.handle_poll_answer)
         self.dp.callback_query(lambda c: c.data.startswith("reaction_"))(self.handle_reaction)
-        self.dp.message(lambda m: m.chat.type in ["group", "supergroup"])(self.handle_message_from_new_member)
+        # Обработчики команд должны идти перед общими обработчиками сообщений
         self.dp.message(Command("htest"))(self.toggle_htest)
         self.dp.message(Command("fastout"))(self.toggle_fastout)
         self.dp.message(Command("status"))(self.show_status)
         self.dp.message(CommandStart())(self.start_command)
+        # Этот обработчик должен быть последним, т.к. он самый общий и отлавливает все сообщения в группе
+        self.dp.message(lambda m: m.chat.type in ["group", "supergroup"])(self.handle_message_from_new_member)
 
     async def start_command(self, message: types.Message):
         """Обработчик команды /start"""
@@ -281,17 +283,28 @@ class VerificationBot:
 
     async def handle_message_from_new_member(self, message: types.Message):
         """Обработка сообщений от участников"""
-        if not self.fastout_enabled or not message.from_user:
+        if not message.from_user:
             return
 
         user_id = message.from_user.id
-        if user_id in self.pending_verifications:
+
+        # Если HTest включен и пользователь на верификации, его сообщения нужно удалять, т.к. у него нет прав
+        if self.htest_enabled and user_id in self.pending_verifications:
+            try:
+                await message.delete()
+                logger.info(f"Удалено сообщение от пользователя {user_id}, который находится на верификации.")
+            except Exception as e:
+                logger.warning(f"Не удалось удалить сообщение от пользователя {user_id} на верификации: {e}")
+            return
+
+        # Если FastOut выключен, дальше не идем
+        if not self.fastout_enabled:
             return
 
         if user_id not in self.user_messages:
             self.user_messages[user_id] = []
         self.user_messages[user_id].append(message.message_id)
-        logger.info(f"Сообщение от пользователя {user_id} в чате {message.chat.id}: {message.text}")
+        logger.debug(f"Сообщение от пользователя {user_id} в чате {message.chat.id} отслежено для FastOut.")
 
     async def handle_member_left(self, event: ChatMemberUpdated):
         """Обработка выхода участника"""
