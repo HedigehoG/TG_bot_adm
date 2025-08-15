@@ -87,14 +87,10 @@ class VerificationBot:
 
     def setup_handlers(self):
         """Настройка обработчиков событий"""
-        # Раздельные, но надежные обработчики для входа и выхода участников
-        self.dp.chat_member(
-            ChatMemberUpdatedFilter(member_status_changed=(IS_NOT_MEMBER, IS_MEMBER))
-        )(self.handle_new_member)
-        self.dp.chat_member(
-            ChatMemberUpdatedFilter(member_status_changed=(IS_MEMBER, IS_NOT_MEMBER))
-        )(self.handle_member_left)
-
+        # Надежная обработка входа и выхода через служебные сообщения
+        self.dp.message(F.new_chat_members)(self.on_new_chat_members)
+        self.dp.message(F.left_chat_member)(self.on_left_chat_member)
+        
         self.dp.poll_answer()(self.handle_poll_answer)
         self.dp.callback_query(AdminAction.filter())(self.handle_reaction)
         self.dp.callback_query(IgnoreCallback.filter())(self.handle_ignore_callback)
@@ -125,25 +121,27 @@ class VerificationBot:
         except TelegramAPIError as e:
             logger.error(f"Ошибка при отправке ответа на /start в чат {message.chat.id}: {e}")
 
-    async def handle_new_member(self, event: ChatMemberUpdated):
-        """Обработка нового участника"""
-        if not self.htest_enabled or event.new_chat_member.user.id == self.bot.id:
+    async def on_new_chat_members(self, message: types.Message):
+        """Обработка входа нового участника через сервисное сообщение."""
+        if not self.htest_enabled:
             return
 
-        user = event.new_chat_member.user
-        chat = event.chat
-        logger.info(f"Новый участник {user.id} в чате {chat.id}")
+        for user in message.new_chat_members:
+            if user.id == self.bot.id:
+                continue
 
-        try:
-            await self.bot.restrict_chat_member(chat_id=chat.id, user_id=user.id, permissions=RESTRICTED_PERMISSIONS)
-            await self.create_verification_poll(chat.id, user)
-        except TelegramAPIError as e:
-            logger.error(f"Ошибка при ограничении прав пользователя {user.id}: {e}")
-
+            logger.info(f"Новый участник {user.id} ({user.full_name}) в чате {message.chat.id}")
+            try:
+                await self.bot.restrict_chat_member(chat_id=message.chat.id, user_id=user.id, permissions=RESTRICTED_PERMISSIONS)
+                await self.create_verification_poll(message.chat.id, user)
+            except TelegramAPIError as e:
+                logger.error(f"Ошибка при ограничении прав пользователя {user.id}: {e}")
+        await message.delete() # Удаляем сообщение "User joined"
+        
     async def create_verification_poll(self, chat_id: int, user: User):
         """Создание опроса для верификации"""
         username = user.username or user.first_name or "Новый участник"
-        poll_question = f"Приветствуем тебя, {username}\nОтветь на вопрос или покинь группу"
+        poll_question = f"Приветствуем тебя, {username}({user.url})\nОтветь на вопрос или покинь группу"
 
         poll_options_all = [
             "Я спам-бот и горжусь этим",
@@ -370,22 +368,21 @@ class VerificationBot:
         self.user_messages[user_id].append(message.message_id)
         logger.debug(f"Сообщение от пользователя {user_id} в чате {message.chat.id} отслежено для FastOut.")
 
-    async def handle_member_left(self, event: ChatMemberUpdated):
-        """Обработка выхода участника"""
+    async def on_left_chat_member(self, message: types.Message):
+        """Обработка выхода участника через сервисное сообщение."""
         if not self.fastout_enabled:
             return
-
-        user_id = event.new_chat_member.user.id
-        chat_id = event.chat.id
-
-        if user_id in self.user_messages:
-            for message_id in self.user_messages[user_id]:
+        
+        user = message.left_chat_member
+        if user.id in self.user_messages:
+            for message_id in self.user_messages[user.id]:
                 try:
-                    await self.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    await self.bot.delete_message(chat_id=message.chat.id, message_id=message_id)
                 except TelegramAPIError as e:
                     logger.error(f"Ошибка при удалении сообщения {message_id}: {e}")
-            del self.user_messages[user_id]
-            logger.info(f"Сообщения пользователя {user_id} удалены из чата {chat_id}")
+            del self.user_messages[user.id]
+            logger.info(f"Сообщения пользователя {user.id} удалены из чата {message.chat.id}")
+        await message.delete() # Удаляем сообщение "User left"
 
     async def toggle_htest(self, message: types.Message):
         """Переключение механизма HTest"""
